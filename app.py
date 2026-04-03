@@ -1,72 +1,143 @@
 #!/usr/bin/python3
-import argparse
-import sys
-import time
+"""
+sre.vaultconfig — a minimal Vault-like key-value store.
+
+Data model:  tenant (company)  →  group  →  key  →  value
+Persistence: JSON flat-file (STORE_FILE env var, default vault_data.json)
+"""
+
 import json
 import logging
-from flask import Flask, Response
 import os
-import base64
-import yaml
-from logging.handlers import TimedRotatingFileHandler
 
-article_info = [
-    {
-        'Details': {
-            'domain': 'www.vaultconfig.com',
-            'language': 'python',
-            'date': '01/04/2023'
-        }
-    }
-]
+from flask import Flask, Response, abort, request
 
-with open("configfile.yml", 'w') as yamlfile:
-    data = yaml.dump(article_info, yamlfile)
-    print("Write successful")
+STORE_FILE = os.environ.get("STORE_FILE", "vault_data.json")
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-configfile = f"configfile.yml"
+
+# ---------------------------------------------------------------------------
+# Persistence helpers
+# ---------------------------------------------------------------------------
+
+def _load() -> dict:
+    """Load the store from disk; return empty dict if the file is missing."""
+    if os.path.exists(STORE_FILE):
+        with open(STORE_FILE) as fh:
+            return json.load(fh)
+    return {}
 
 
-def load_config():
-    with open(configfile) as data:
-        configdict = yaml.safe_load(data)
-    return configdict
+def _save(store: dict) -> None:
+    """Persist the store to disk atomically."""
+    tmp = STORE_FILE + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(store, fh, indent=2)
+    os.replace(tmp, STORE_FILE)
 
 
-@app.route("/config", methods=['GET'])
-def get_config():
-    jsonstring = json.dumps(load_config(), ensure_ascii=False)
-    # , charset='utf-8')
-    response = Response(jsonstring, content_type='application/json')
-    return response
+def _json(data, status: int = 200) -> Response:
+    return Response(json.dumps(data, ensure_ascii=False),
+                    status=status,
+                    content_type="application/json")
 
 
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='This is a demo.')
-    parser.add_argument("-l", "--log", dest="logLevel", choices=[
-                        'DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'], default='INFO', help="Set the logging level")
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
 
-    args = parser.parse_args()
-    filename = os.path.basename(__file__).rsplit('.', 1)[0]
-    # logging.basicConfig(filename = f"{filename}.log", level = logging.INFO, format = '%(asctime)s:%(levelname)s:%(message)s')
+@app.route("/v1", methods=["GET"])
+def list_tenants():
+    """List all tenant names."""
+    store = _load()
+    return _json({"tenants": sorted(store.keys())})
 
-    LOGFILE = ''
-    logger = logging.getLogger(__name__)
-    format = '%(asctime)s-[%(levelname)s]-[%(name)s]::%(message)s'
-    # fileHandler = logging.FileHandler(f"{os.path.abspath(__file__)}.log")
-    fileHandler = TimedRotatingFileHandler(
-        f"{__name__}.log", when='d', interval=1, backupCount=30)
-    streamHandler = logging.StreamHandler()
-    fileHandler.setFormatter(logging.Formatter(format))
-    streamHandler.setFormatter(logging.Formatter(format))
-    logging.basicConfig(
-        # format='%(asctime)s-[%(levelname)s]-[%(name)s]::%(message)s',
-        level=getattr(logging, args.logLevel),
-        handlers=[fileHandler, streamHandler]
-        #  datefmt='%Y-%m-%d %H:%M:%S',
-        # filename = f"{filename}.log",
-    )
-    logger.info(f"Log enabled in Main::::{args.logLevel}.")
-    app.run(host='127.0.0.1', port=int('5000'), debug=True)
+
+@app.route("/v1/<tenant>", methods=["GET"])
+def list_groups(tenant: str):
+    """List all groups for a tenant."""
+    store = _load()
+    if tenant not in store:
+        abort(404, description=f"Tenant '{tenant}' not found")
+    return _json({"tenant": tenant, "groups": sorted(store[tenant].keys())})
+
+
+@app.route("/v1/<tenant>/<group>", methods=["GET"])
+def list_keys(tenant: str, group: str):
+    """List all keys inside a group."""
+    store = _load()
+    if tenant not in store or group not in store.get(tenant, {}):
+        abort(404, description=f"Group '{tenant}/{group}' not found")
+    return _json({"tenant": tenant,
+                  "group": group,
+                  "keys": sorted(store[tenant][group].keys())})
+
+
+@app.route("/v1/<tenant>/<group>/<key>", methods=["GET"])
+def read_secret(tenant: str, group: str, key: str):
+    """Read a single secret value."""
+    store = _load()
+    try:
+        value = store[tenant][group][key]
+    except KeyError:
+        abort(404, description=f"Key '{tenant}/{group}/{key}' not found")
+    return _json({"tenant": tenant, "group": group, "key": key, "value": value})
+
+
+@app.route("/v1/<tenant>/<group>/<key>", methods=["PUT"])
+def write_secret(tenant: str, group: str, key: str):
+    """Create or update a secret.  Body: {"value": "<secret>"}"""
+    body = request.get_json(silent=True) or {}
+    if "value" not in body:
+        abort(400, description="Request body must contain a 'value' field")
+    store = _load()
+    tenant_store = store.setdefault(tenant, {})
+    group_store = tenant_store.setdefault(group, {})
+    group_store[key] = body["value"]
+    _save(store)
+    logger.info("Written %s/%s/%s", tenant, group, key)
+    return _json({"tenant": tenant, "group": group, "key": key,
+                  "value": body["value"]}, status=201)
+
+
+@app.route("/v1/<tenant>/<group>/<key>", methods=["DELETE"])
+def delete_secret(tenant: str, group: str, key: str):
+    """Delete a secret."""
+    store = _load()
+    try:
+        del store[tenant][group][key]
+    except KeyError:
+        abort(404, description=f"Key '{tenant}/{group}/{key}' not found")
+    # Clean up empty parent nodes
+    if not store[tenant][group]:
+        del store[tenant][group]
+    if not store[tenant]:
+        del store[tenant]
+    _save(store)
+    logger.info("Deleted %s/%s/%s", tenant, group, key)
+    return _json({"deleted": True, "key": key})
+
+
+# ---------------------------------------------------------------------------
+# Error handlers
+# ---------------------------------------------------------------------------
+
+@app.errorhandler(400)
+@app.errorhandler(404)
+def http_error(e):
+    return _json({"error": e.description}, status=e.code)
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=False)
